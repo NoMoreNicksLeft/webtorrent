@@ -4,6 +4,7 @@ import path from 'path'
 import createTorrent, { parseInput } from 'create-torrent'
 import debugFactory from 'debug'
 import { Client as DHT } from 'bittorrent-dht' // browser exclude
+import { DHTNode as WebRTCDHT } from 'webrtc-dht'
 import loadIPSet from 'load-ip-set' // browser exclude
 import parallel from 'run-parallel'
 import parseTorrent from 'parse-torrent'
@@ -157,6 +158,28 @@ export default class WebTorrent extends EventEmitter {
       this.dht = false
     }
 
+    // WebRTC DHT — works in both browser and Node.js
+    // Provides BEP 44 mutable item support and browser-side peer discovery
+    if (opts.webrtcDht !== false) {
+      const webrtcDhtOpts = typeof opts.webrtcDht === 'object' ? opts.webrtcDht : {}
+      this.webrtcDht = new WebRTCDHT({
+        nodeId: this.nodeId ? hex2arr(this.nodeId) : undefined,
+        trackers: webrtcDhtOpts.trackers || ['wss://tracker.openwebtorrent.com', 'wss://tracker.webtorrent.dev'],
+        maxPeers: webrtcDhtOpts.maxPeers || 50,
+        ...webrtcDhtOpts
+      })
+      this._webrtcDhtReady = false
+      this.webrtcDht.join().then(() => {
+        this._webrtcDhtReady = true
+        this._debug('WebRTC DHT ready, routing table size: %d', this.webrtcDht.routingTable.size)
+        this.emit('webrtcDht:ready')
+      }).catch(err => {
+        this._debug('WebRTC DHT join failed: %o', err)
+      })
+    } else {
+      this.webrtcDht = null
+    }
+
     // Enable or disable BEP19 (Web Seeds). Enabled by default:
     this.enableWebSeeds = opts.webSeeds !== false
 
@@ -292,6 +315,102 @@ export default class WebTorrent extends EventEmitter {
     torrent.once('close', onClose)
 
     this.emit('add', torrent)
+    return torrent
+  }
+
+  /**
+   * Add a mutable torrent by public key (BEP 46).
+   * Resolves the current info hash via the WebRTC DHT, then adds the torrent normally.
+   *
+   * @param {Uint8Array|string} publicKey - 32-byte Ed25519 public key (or hex string)
+   * @param {Object} [opts]
+   * @param {Uint8Array|string} [opts.salt] - optional salt (or hex string)
+   * @param {number} [opts.pollInterval=60000] - ms between update checks
+   * @param {function} [ontorrent] - called when the torrent is ready
+   * @returns {Promise<Torrent>}
+   */
+  async addMutable (publicKey, opts = {}, ontorrent = () => {}) {
+    if (this.destroyed) throw new Error('client is destroyed')
+    if (!this.webrtcDht) throw new Error('WebRTC DHT is not enabled')
+    if (typeof opts === 'function') [opts, ontorrent] = [{}, opts]
+
+    const pubKeyBytes = typeof publicKey === 'string'
+      ? new Uint8Array(publicKey.match(/.{2}/g).map(b => parseInt(b, 16)))
+      : new Uint8Array(publicKey)
+
+    const saltBytes = opts.salt
+      ? (typeof opts.salt === 'string'
+          ? new Uint8Array(opts.salt.match(/.{2}/g).map(b => parseInt(b, 16)))
+          : new Uint8Array(opts.salt))
+      : new Uint8Array(0)
+
+    this._debug('addMutable publicKey=%s salt=%s',
+      Array.from(pubKeyBytes).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16) + '...',
+      saltBytes.length > 0 ? Array.from(saltBytes).map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16) : '(none)')
+
+    // Wait for WebRTC DHT to be ready
+    if (!this._webrtcDhtReady) {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('WebRTC DHT not ready')), 30000)
+        this.once('webrtcDht:ready', () => { clearTimeout(timeout); resolve() })
+      })
+    }
+
+    // Compute the target: sha1(publicKey + salt)
+    const targetInput = new Uint8Array(pubKeyBytes.length + saltBytes.length)
+    targetInput.set(pubKeyBytes)
+    targetInput.set(saltBytes, pubKeyBytes.length)
+    const crypto = globalThis.crypto || (await import('node:crypto')).webcrypto
+    const target = new Uint8Array(await crypto.subtle.digest('SHA-1', targetInput))
+
+    // Resolve the mutable item from the DHT
+    const item = await this.webrtcDht.get(target)
+    if (!item || !item.v) {
+      throw new Error('Mutable torrent not found in DHT')
+    }
+
+    // item.v contains the bencoded info hash (20 bytes)
+    const infoHash = item.v
+    const infoHashHex = Array.from(new Uint8Array(infoHash)).map(b => b.toString(16).padStart(2, '0')).join('')
+
+    this._debug('addMutable resolved to infoHash=%s seq=%d', infoHashHex, item.seq)
+
+    // Add the resolved torrent normally
+    const torrent = this.add(infoHashHex, opts, ontorrent)
+
+    // Attach mutable metadata to the torrent
+    torrent._mutable = {
+      publicKey: pubKeyBytes,
+      salt: saltBytes,
+      seq: item.seq,
+      target
+    }
+
+    // Set up polling for updates
+    const pollInterval = opts.pollInterval || 60000
+    torrent._mutablePollId = setInterval(async () => {
+      if (torrent.destroyed) {
+        clearInterval(torrent._mutablePollId)
+        return
+      }
+      try {
+        const updated = await this.webrtcDht.get(target, torrent._mutable.seq)
+        if (updated && updated.seq > torrent._mutable.seq) {
+          const newHash = Array.from(new Uint8Array(updated.v)).map(b => b.toString(16).padStart(2, '0')).join('')
+          this._debug('addMutable update detected: seq %d -> %d, hash %s', torrent._mutable.seq, updated.seq, newHash)
+          torrent._mutable.seq = updated.seq
+          torrent.emit('mutableUpdate', {
+            seq: updated.seq,
+            infoHash: newHash,
+            previousInfoHash: torrent.infoHash
+          })
+        }
+      } catch {
+        // Ignore poll failures
+      }
+    }, pollInterval)
+    if (torrent._mutablePollId.unref) torrent._mutablePollId.unref()
+
     return torrent
   }
 
@@ -504,6 +623,11 @@ export default class WebTorrent extends EventEmitter {
     this.torrents = []
     this._connPool = null
     this.dht = null
+
+    if (this.webrtcDht) {
+      this.webrtcDht.destroy()
+      this.webrtcDht = null
+    }
 
     this.throttleGroups.down.destroy()
     this.throttleGroups.up.destroy()
