@@ -360,7 +360,7 @@ export default class WebTorrent extends EventEmitter {
     const targetInput = new Uint8Array(pubKeyBytes.length + saltBytes.length)
     targetInput.set(pubKeyBytes)
     targetInput.set(saltBytes, pubKeyBytes.length)
-    const crypto = globalThis.crypto || (await import('node:crypto')).webcrypto
+    const crypto = globalThis.crypto
     const target = new Uint8Array(await crypto.subtle.digest('SHA-1', targetInput))
 
     // Resolve the mutable item from the DHT

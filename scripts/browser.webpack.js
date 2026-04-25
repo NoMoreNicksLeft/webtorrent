@@ -1,6 +1,6 @@
 import webpack from 'webpack'
 import TerserPlugin from 'terser-webpack-plugin'
-import info from '../package.json' assert { type: 'json' }
+import info from '../package.json' with { type: 'json' }
 
 /** @type {import('webpack').Configuration} */
 export default {
@@ -10,6 +10,7 @@ export default {
     aliasFields: ['browser'],
     alias: {
       ...info.browser,
+      'node:crypto': false,
       path: 'path-esm'
     }
   },
